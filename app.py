@@ -1,12 +1,5 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Aug 30 14:39:09 2025
-
-@author: Suporte
-"""
-
 # ==========================================
-# Guarita - Controle de Chaves (Completo)
+# Guarita - Controle de Chaves (Revisado)
 # ==========================================
 import os, io, uuid, sqlite3, datetime, zipfile
 from typing import Optional, Tuple, List
@@ -15,6 +8,7 @@ import streamlit as st
 from PIL import Image
 from streamlit_drawable_canvas import st_canvas
 import qrcode
+import sqlite3 as _sqlite3  # para capturar IntegrityError de forma explícita
 
 # -------------- Configurações --------------
 st.set_page_config(page_title="Guarita - Controle de Chaves", layout="wide")
@@ -86,7 +80,7 @@ def conn():
     """)
     return c
 
-# ----- CRUD helpers: Spaces -----
+# ----- Helpers: Spaces -----
 def add_space(key_number: int, room_name: str, location: str = ""):
     c = conn()
     with c:
@@ -105,7 +99,13 @@ def update_space(key_number: int, room_name: str, location: str, is_active: int)
         c.execute("UPDATE spaces SET room_name=?, location=?, is_active=? WHERE key_number=?",
                   (room_name, location, int(is_active), key_number))
 
-# ----- CRUD helpers: Persons -----
+def space_exists_and_active(key_number: int) -> bool:
+    c = conn()
+    cur = c.cursor()
+    cur.execute("SELECT 1 FROM spaces WHERE key_number=? AND is_active=1", (key_number,))
+    return cur.fetchone() is not None
+
+# ----- Helpers: Persons -----
 def add_person(name: str, id_code: str = "", phone: str = ""):
     c = conn()
     with c:
@@ -124,7 +124,7 @@ def update_person(pid: str, name: str, id_code: str, phone: str, is_active: int)
         c.execute("UPDATE persons SET name=?, id_code=?, phone=?, is_active=? WHERE id=?",
                   (name, id_code, phone, int(is_active), pid))
 
-# ----- Transactions / Operação -----
+# ----- Operação / Transactions -----
 def has_open_checkout(key_number: int) -> bool:
     c = conn()
     cur = c.cursor()
@@ -135,21 +135,37 @@ def has_open_checkout(key_number: int) -> bool:
 
 def open_checkout(key_number: int, name: str, id_code: str, phone: str,
                   due_time: Optional[datetime.datetime], signature_png: Optional[bytes]) -> Tuple[bool, str]:
+    # Chave precisa existir e estar ativa
+    if not space_exists_and_active(key_number):
+        return False, f"A chave {key_number} não está cadastrada como ATIVA. Cadastre/ative em Cadastros → Espaços."
+    # Nome é obrigatório
+    name = (name or "").strip()
+    if not name:
+        return False, "Informe o nome de quem está retirando a chave."
+    # Impede duplicidade de retirada
     if has_open_checkout(key_number):
         return False, "Esta chave já está EM USO. Faça a devolução antes de nova retirada."
+
     c = conn()
     tid = str(uuid.uuid4())
-    with c:
-        c.execute("""INSERT INTO transactions
-                     (id,key_number,taken_by_name,taken_by_id,taken_phone,checkout_time,due_time,checkin_time,status,signature_out,signature_in)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-                  (tid, key_number, name.strip(), id_code.strip(), phone.strip(),
-                   now_iso(),
-                   due_time.isoformat(timespec="seconds") if due_time else None,
-                   None, "EM_USO", signature_png, None))
-    return True, tid
+    try:
+        with c:
+            c.execute("""INSERT INTO transactions
+                         (id,key_number,taken_by_name,taken_by_id,taken_phone,checkout_time,due_time,checkin_time,status,signature_out,signature_in)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                      (tid, key_number, name, (id_code or "").strip(), (phone or "").strip(),
+                       now_iso(),
+                       due_time.isoformat(timespec="seconds") if due_time else None,
+                       None, "EM_USO", signature_png, None))
+        return True, tid
+    except _sqlite3.IntegrityError:
+        # Mensagem amigável ao operador
+        return False, "Não foi possível registrar a retirada. Verifique se a chave existe/está ativa e os campos obrigatórios."
 
 def do_checkin(key_number: int, signature_png: Optional[bytes]) -> Tuple[bool, str]:
+    # impede devolução de chave inexistente/inativa
+    if not space_exists_and_active(key_number):
+        return False, f"A chave {key_number} não está cadastrada/ativa. Cadastre/ative em Cadastros → Espaços."
     c = conn()
     cur = c.cursor()
     cur.execute("""SELECT id FROM transactions 
@@ -175,12 +191,11 @@ def list_status() -> pd.DataFrame:
         ) m ON t.key_number=m.key_number AND t.checkout_time=m.max_co
     """, c)
     df = df_space.merge(df_tx, on="key_number", how="left")
-    # Computa status atual
+
     def compute_status(row):
         if pd.isna(row["checkout_time"]):
             return "DISPONÍVEL"
         if pd.isna(row["checkin_time"]):
-            # em uso; checa atraso
             if pd.notna(row["due_time"]):
                 try:
                     due = datetime.datetime.fromisoformat(str(row["due_time"]))
@@ -190,6 +205,7 @@ def list_status() -> pd.DataFrame:
                     pass
             return "EM_USO"
         return "DISPONÍVEL"
+
     df["status"] = df.apply(compute_status, axis=1)
     return df[["key_number","room_name","location","status","checkout_time","due_time","checkin_time"]].sort_values("key_number")
 
@@ -260,16 +276,14 @@ with tab_op:
     st.markdown("---")
     st.subheader("Retirar / Devolver")
 
-    # Define modo conforme query param ou escolha
     modos = ["Retirar", "Devolver"]
     default_idx = 0 if (qp_action in (None, "retirar")) else 1
     modo = st.radio("Ação", modos, horizontal=True, index=default_idx)
 
-    # Número da chave (prefill por query param)
     default_key = int(qp_key) if (qp_key and str(qp_key).isdigit()) else None
     key_number = st.number_input("Nº da chave", min_value=1, step=1, value=default_key if default_key else 1)
 
-    # Busca dados da sala para exibir
+    # Mostra dados da sala
     df_spaces_all = list_spaces(active_only=False)
     room_info = df_spaces_all[df_spaces_all["key_number"] == int(key_number)]
     if not room_info.empty:
@@ -277,7 +291,7 @@ with tab_op:
         loc = room_info.iloc[0]["location"] or ""
         st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}")
 
-    # Dados do responsável: pode usar cadastro ou preencher manualmente
+    # Dados do responsável
     st.markdown("**Dados do responsável**")
     df_persons = list_persons(active_only=True)
     use_registry = st.checkbox("Usar cadastro de responsável", value=True)
@@ -299,7 +313,6 @@ with tab_op:
         taken_phone   = st.text_input("Telefone", value="")
 
     # Prazos padrão
-    due_choice = None
     due_time = None
     if modo == "Retirar":
         due_choice = st.selectbox("Prazo de devolução", ["Hoje 12:00", "Hoje 18:00", "Outro", "Sem prazo"])
@@ -314,20 +327,36 @@ with tab_op:
         else:
             due_time = None
 
-    # Assinaturas
-    col1, col2 = st.columns(2)
+    # Assinaturas e botões
     if modo == "Retirar":
-        with col1:
-            st.caption("Assinatura – Entrega da chave")
-            canvas_out = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=2,
-                stroke_color="#000000",
-                background_color="#FFFFFF",
-                height=180, width=500, drawing_mode="freedraw", key="sig_out"
-            )
-    else:
-        with col1:
+        st.caption("Assinatura – Entrega da chave")
+        canvas_out = st_canvas(
+            fill_color="rgba(0, 0, 0, 0)",
+            stroke_width=2,
+            stroke_color="#000000",
+            background_color="#FFFFFF",
+            height=180, width=500, drawing_mode="freedraw", key="sig_out"
+        )
+
+        if st.button("Confirmar retirada"):
+            sig_bytes = None
+            if canvas_out.image_data is not None:
+                try:
+                    img = Image.fromarray((canvas_out.image_data).astype("uint8"))
+                    buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
+                except Exception:
+                    sig_bytes = None
+            ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_phone, due_time, sig_bytes)
+            if ok:
+                st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
+            else:
+                st.error(msg)
+
+    else:  # Devolver
+        # Bloqueia devolução de chave inexistente/inativa
+        if not space_exists_and_active(int(key_number)):
+            st.error(f"A chave {int(key_number)} não está cadastrada/ativa. Cadastre ou ative em Cadastros → Espaços.")
+        else:
             st.caption("Assinatura – Devolução da chave")
             canvas_in = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
@@ -336,46 +365,26 @@ with tab_op:
                 background_color="#FFFFFF",
                 height=180, width=500, drawing_mode="freedraw", key="sig_in"
             )
-
-    # Botões de ação (restringe confirmação se não admin)
-    st.markdown("")
-    if modo == "Retirar":
-        can_submit = True  # operador pode registrar operação
-        btn = st.button("Confirmar retirada")
-        if btn:
-            if not taken_by_name.strip():
-                st.error("Informe o nome de quem pegou.")
-            else:
+            if st.button("Confirmar devolução"):
                 sig_bytes = None
-                if 'canvas_out' in locals() and canvas_out.image_data is not None:
+                if canvas_in.image_data is not None:
                     try:
-                        img = Image.fromarray((canvas_out.image_data).astype("uint8"))
+                        img = Image.fromarray((canvas_in.image_data).astype("uint8"))
                         buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
                     except Exception:
                         sig_bytes = None
-                ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_phone, due_time, sig_bytes)
+                ok, msg = do_checkin(int(key_number), sig_bytes)
                 if ok:
-                    st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
+                    st.success(f"Chave {int(key_number)} devolvida. Protocolo: {msg}")
                 else:
                     st.error(msg)
 
-    else:  # Devolver
-        btn = st.button("Confirmar devolução")
-        if btn:
-            sig_bytes = None
-            if 'canvas_in' in locals() and canvas_in.image_data is not None:
-                try:
-                    img = Image.fromarray((canvas_in.image_data).astype("uint8"))
-                    buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
-                except Exception:
-                    sig_bytes = None
-            ok, msg = do_checkin(int(key_number), sig_bytes)
-            if ok:
-                st.success(f"Chave {int(key_number)} devolvida. Protocolo: {msg}")
-            else:
-                st.error(msg)
-
 # -------------- CADASTROS (ADMIN) -----------
+if is_admin:
+    tab_op, tab_cad, tab_rep, tab_qr = st.tabs(["Operação", "Cadastros (Admin)", "Relatórios (Admin)", "QR Codes (Admin)"])
+else:
+    tab_op, = st.tabs(["Operação"])  # já criado acima; apenas para manter referência
+
 if is_admin:
     with tab_cad:
         st.subheader("Espaços (Chaves/Salas)")
@@ -466,7 +475,6 @@ if is_admin:
         df_tx = list_transactions(start_dt, end_dt)
         st.dataframe(df_tx, use_container_width=True)
 
-        # Métricas
         total = len(df_tx)
         em_uso = sum((pd.isna(df_tx["checkin_time"])))
         atrasadas = 0
@@ -484,7 +492,6 @@ if is_admin:
         m2.metric("Em uso (abertas)", em_uso)
         m3.metric("Atrasadas (abertas)", atrasadas)
 
-        # Exportar CSV
         csv = df_tx.to_csv(index=False).encode("utf-8")
         st.download_button("Baixar CSV", data=csv, file_name="movimentacoes.csv")
 
@@ -505,7 +512,6 @@ if is_admin:
             action_map = {"Somente info":"info", "Retirar":"retirar", "Devolver":"devolver"}
             action = action_map[modo_qr]
 
-            # Geração em grade + opcional ZIP
             images_for_zip = []
             if ids:
                 rows = (len(ids) + cols - 1) // cols
@@ -521,7 +527,6 @@ if is_admin:
                             st.caption(url)
                             images_for_zip.append((f"chave_{keyn}.png", to_png_bytes(img)))
 
-                # Download em ZIP
                 if images_for_zip:
                     buf = io.BytesIO()
                     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
