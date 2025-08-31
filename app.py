@@ -1,5 +1,5 @@
 # ==========================================
-# Guarita - Controle de Chaves (Revisado - sem IDs duplicados)
+# Guarita - Controle de Chaves (Completo + Autorizações + Categorias + Atraso 23h)
 # ==========================================
 import os, io, uuid, sqlite3, datetime, zipfile
 from typing import Optional, Tuple, List
@@ -17,6 +17,9 @@ APP_TITLE = "Guarita – Controle de Chaves"
 ADMIN_PASS = st.secrets.get("STREAMLIT_ADMIN_PASS", os.getenv("STREAMLIT_ADMIN_PASS", ""))
 SECRET_BASE_URL = st.secrets.get("BASE_URL", os.getenv("BASE_URL", "")).strip()
 DB_PATH = os.getenv("DB_PATH", "keys.db")
+
+# Corte para atraso "até 23:00 do dia" (padrão 23)
+CUTOFF_HOUR_FOR_OVERDUE = int(os.getenv("CUTOFF_HOUR_FOR_OVERDUE", "23"))
 
 # -------------- Utilidades -----------------
 def now_iso():
@@ -38,13 +41,14 @@ def build_url(base_url: str, params: dict) -> str:
     base = (base_url or "").rstrip("/")
     if not base:
         return ""
-    query = "&".join(f"{k}={v}" for k, v in params.items())
+    query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None and v != "")
     return f"{base}/?{query}" if query else f"{base}/"
 
 # -------------- Banco de Dados -------------
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("""PRAGMA foreign_keys = ON;""")
+    # spaces (adicionamos category por migração)
     c.execute("""
       CREATE TABLE IF NOT EXISTS spaces(
         key_number INTEGER PRIMARY KEY,
@@ -53,6 +57,12 @@ def conn():
         is_active  INTEGER DEFAULT 1
       )
     """)
+    # MIGRAÇÃO: coluna category
+    try:
+        c.execute("ALTER TABLE spaces ADD COLUMN category TEXT DEFAULT 'Sala'")
+    except Exception:
+        pass
+
     c.execute("""
       CREATE TABLE IF NOT EXISTS persons(
         id TEXT PRIMARY KEY,
@@ -78,14 +88,36 @@ def conn():
         FOREIGN KEY (key_number) REFERENCES spaces(key_number)
       )
     """)
+    # Autorizações
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS authorizations(
+        id TEXT PRIMARY KEY,
+        key_number INTEGER NOT NULL,
+        memo_number TEXT,
+        valid_from TEXT,
+        valid_to   TEXT,
+        created_at TEXT,
+        FOREIGN KEY (key_number) REFERENCES spaces(key_number)
+      )
+    """)
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS authorization_people(
+        id TEXT PRIMARY KEY,
+        authorization_id TEXT NOT NULL,
+        person_id TEXT NOT NULL,
+        FOREIGN KEY (authorization_id) REFERENCES authorizations(id),
+        FOREIGN KEY (person_id) REFERENCES persons(id)
+      )
+    """)
     return c
 
 # ----- Helpers: Spaces -----
-def add_space(key_number: int, room_name: str, location: str = ""):
+def add_space(key_number: int, room_name: str, location: str = "", category: str = "Sala"):
     c = conn()
     with c:
-        c.execute("INSERT OR REPLACE INTO spaces(key_number,room_name,location,is_active) VALUES(?,?,?,1)",
-                  (key_number, room_name, location))
+        c.execute("""INSERT OR REPLACE INTO spaces(key_number,room_name,location,is_active,category)
+                     VALUES(?,?,?,?,?)""",
+                  (key_number, room_name, location, 1, category))
 
 def list_spaces(active_only=True):
     c = conn()
@@ -93,11 +125,11 @@ def list_spaces(active_only=True):
         return pd.read_sql_query("SELECT * FROM spaces WHERE is_active=1 ORDER BY key_number", c)
     return pd.read_sql_query("SELECT * FROM spaces ORDER BY key_number", c)
 
-def update_space(key_number: int, room_name: str, location: str, is_active: int):
+def update_space(key_number: int, room_name: str, location: str, is_active: int, category: str = "Sala"):
     c = conn()
     with c:
-        c.execute("UPDATE spaces SET room_name=?, location=?, is_active=? WHERE key_number=?",
-                  (room_name, location, int(is_active), key_number))
+        c.execute("""UPDATE spaces SET room_name=?, location=?, is_active=?, category=? WHERE key_number=?""",
+                  (room_name, location, int(is_active), category, key_number))
 
 def space_exists_and_active(key_number: int) -> bool:
     c = conn()
@@ -123,6 +155,50 @@ def update_person(pid: str, name: str, id_code: str, phone: str, is_active: int)
     with c:
         c.execute("UPDATE persons SET name=?, id_code=?, phone=?, is_active=? WHERE id=?",
                   (name, id_code, phone, int(is_active), pid))
+
+# ----- Helpers: Autorizações -----
+def add_authorization(key_number:int, memo_number:str, valid_from:Optional[datetime.date], valid_to:Optional[datetime.date]) -> str:
+    c = conn(); aid = str(uuid.uuid4())
+    with c:
+        c.execute("""INSERT INTO authorizations(id,key_number,memo_number,valid_from,valid_to,created_at)
+                     VALUES(?,?,?,?,?,?)""",
+                  (aid, key_number, memo_number,
+                   datetime.datetime.combine(valid_from, datetime.time.min).isoformat(timespec="seconds") if valid_from else None,
+                   datetime.datetime.combine(valid_to,   datetime.time.max).isoformat(timespec="seconds") if valid_to   else None,
+                   now_iso()))
+    return aid
+
+def list_authorizations(key_number:int=None) -> pd.DataFrame:
+    c = conn()
+    q = "SELECT * FROM authorizations"
+    p = []
+    if key_number is not None:
+        q += " WHERE key_number=?"
+        p.append(key_number)
+    q += " ORDER BY created_at DESC"
+    return pd.read_sql_query(q, c, params=p)
+
+def add_person_to_authorization(authorization_id:str, person_id:str):
+    c = conn()
+    with c:
+        c.execute("""INSERT INTO authorization_people(id,authorization_id,person_id)
+                     VALUES(?,?,?)""", (str(uuid.uuid4()), authorization_id, person_id))
+
+def list_authorized_people_now(key_number:int) -> pd.DataFrame:
+    """Retorna pessoas autorizadas para esta chave no momento atual."""
+    c = conn()
+    now = now_iso()
+    q = """
+    SELECT p.*
+    FROM persons p
+    JOIN authorization_people ap ON ap.person_id = p.id
+    JOIN authorizations a ON a.id = ap.authorization_id
+    WHERE a.key_number = ?
+      AND (a.valid_from IS NULL OR datetime(a.valid_from) <= datetime(?))
+      AND (a.valid_to   IS NULL OR datetime(a.valid_to)   >= datetime(?))
+      AND p.is_active = 1
+    """
+    return pd.read_sql_query(q, c, params=[key_number, now, now])
 
 # ----- Operação / Transactions -----
 def has_open_checkout(key_number: int) -> bool:
@@ -176,7 +252,7 @@ def do_checkin(key_number: int, signature_png: Optional[bytes]) -> Tuple[bool, s
 
 def list_status() -> pd.DataFrame:
     c = conn()
-    df_space = list_spaces(active_only=True)
+    df_space = list_spaces(active_only=True)  # inclui category
     df_tx = pd.read_sql_query("""
         SELECT t.key_number, t.checkout_time, t.due_time, t.checkin_time, t.status AS last_status
         FROM transactions t
@@ -190,18 +266,28 @@ def list_status() -> pd.DataFrame:
         if pd.isna(row["checkout_time"]):
             return "DISPONÍVEL"
         if pd.isna(row["checkin_time"]):
+            now = datetime.datetime.now()
             if pd.notna(row["due_time"]):
                 try:
                     due = datetime.datetime.fromisoformat(str(row["due_time"]))
-                    if datetime.datetime.now() > due:
+                    if now > due:
                         return "ATRASADA"
                 except Exception:
                     pass
+            try:
+                co = datetime.datetime.fromisoformat(str(row["checkout_time"]))
+                limit = co.replace(hour=CUTOFF_HOUR_FOR_OVERDUE, minute=0, second=0, microsecond=0)
+                if limit < co:
+                    limit = limit + datetime.timedelta(days=1)
+                if now > limit:
+                    return "ATRASADA"
+            except Exception:
+                pass
             return "EM_USO"
         return "DISPONÍVEL"
 
     df["status"] = df.apply(compute_status, axis=1)
-    return df[["key_number","room_name","location","status","checkout_time","due_time","checkin_time"]].sort_values("key_number")
+    return df[["key_number","room_name","location","category","status","checkout_time","due_time","checkin_time"]].sort_values("key_number")
 
 def list_transactions(start: Optional[datetime.datetime] = None,
                       end: Optional[datetime.datetime] = None) -> pd.DataFrame:
@@ -244,15 +330,17 @@ with st.sidebar:
         base_url = st.text_input("Base URL (para QRs)", value="http://localhost:8501", key="qr_base_url",
                                  help="Defina BASE_URL em Secrets para fixar permanentemente.")
 
-# Query params (?key=12&action=devolver)
+# Query params (?key=12&action=devolver&pid=<person_id>)
 qp = st.query_params
 qp_key = qp.get("key")
 if isinstance(qp_key, list): qp_key = qp_key[0]
 qp_action = qp.get("action")
 if isinstance(qp_action, list): qp_action = qp_action[0]
 if qp_action not in ("retirar", "devolver", "info"): qp_action = None
+qp_pid = qp.get("pid")
+if isinstance(qp_pid, list): qp_pid = qp_pid[0]
 
-# -------------- Abas principais (UMA vez) --------------
+# -------------- Abas principais --------------
 if is_admin:
     tab_op, tab_cad, tab_rep, tab_qr = st.tabs(["Operação", "Cadastros (Admin)", "Relatórios (Admin)", "QR Codes (Admin)"])
 else:
@@ -261,8 +349,15 @@ else:
 # -------------- OPERAÇÃO ---------------------
 with tab_op:
     st.subheader("Status das chaves")
+    cats = ["Todas", "Sala", "Laboratório", "Secretaria"]
+    sel_cat = st.selectbox("Filtrar por categoria", cats, index=0, key="op_cat")
     df_status = list_status()
+    if sel_cat != "Todas":
+        df_status = df_status[df_status["category"] == sel_cat]
     st.dataframe(df_status, use_container_width=True)
+    num_atraso = (df_status["status"] == "ATRASADA").sum()
+    if num_atraso:
+        st.error(f"⚠️ {num_atraso} chave(s) ATRASADA(s).")
 
     st.markdown("---")
     st.subheader("Retirar / Devolver")
@@ -275,33 +370,53 @@ with tab_op:
     key_number = st.number_input("Nº da chave", min_value=1, step=1,
                                  value=default_key if default_key else 1, key="op_keynum")
 
+    # Info do espaço
     df_spaces_all = list_spaces(active_only=False)
     room_info = df_spaces_all[df_spaces_all["key_number"] == int(key_number)]
     if not room_info.empty:
         rn = room_info.iloc[0]["room_name"]
         loc = room_info.iloc[0]["location"] or ""
-        st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}")
+        cat = room_info.iloc[0]["category"] or "Sala"
+        st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}  •  Categoria: {cat}")
+
+    # Autorizados vigentes (se houver) — restringe a lista
+    df_authorized_now = list_authorized_people_now(int(key_number))
+    if df_authorized_now.empty:
+        st.warning("⚠️ Não há autorização vigente para esta chave. (Admin pode cadastrar em Cadastros → Autorizações)")
+        df_persons = list_persons(active_only=True)
+    else:
+        df_persons = df_authorized_now
+
+    # Dados do responsável (com QR personalizado via pid)
+    prefilled = None
+    if qp_pid and not df_persons.empty and (df_persons["id"] == qp_pid).any():
+        prow = df_persons[df_persons["id"] == qp_pid].iloc[0]
+        prefilled = {"name": prow["name"], "id_code": prow["id_code"], "phone": prow["phone"]}
 
     st.markdown("**Dados do responsável**")
-    df_persons = list_persons(active_only=True)
     use_registry = st.checkbox("Usar cadastro de responsável", value=True, key="op_use_registry")
 
-    if use_registry and not df_persons.empty:
+    if prefilled:
+        st.info(f"QR personalizado para **{prefilled['name']}**")
+        taken_by_name = st.text_input("Nome de quem pegou", value=prefilled["name"], key="op_nome_pref", disabled=True)
+        taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=prefilled["id_code"], key="op_idcode_pref", disabled=True)
+        taken_by_phone = st.text_input("Telefone", value=prefilled["phone"], key="op_phone_pref", disabled=True)
+    elif use_registry and not df_persons.empty:
         sel_name = st.selectbox("Responsável (cadastro)", options=["-- selecione --"] + df_persons["name"].tolist(),
                                 key="op_sel_person")
         if sel_name != "-- selecione --":
             rowp = df_persons[df_persons["name"] == sel_name].iloc[0]
             taken_by_name = st.text_input("Nome de quem pegou", value=rowp["name"], key="op_nome")
             taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=rowp["id_code"], key="op_idcode")
-            taken_phone   = st.text_input("Telefone", value=rowp["phone"], key="op_phone")
+            taken_by_phone= st.text_input("Telefone", value=rowp["phone"], key="op_phone")
         else:
             taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_blank")
             taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_blank")
-            taken_phone   = st.text_input("Telefone", value="", key="op_phone_blank")
+            taken_by_phone= st.text_input("Telefone", value="", key="op_phone_blank")
     else:
         taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_manual")
         taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_manual")
-        taken_phone   = st.text_input("Telefone", value="", key="op_phone_manual")
+        taken_by_phone= st.text_input("Telefone", value="", key="op_phone_manual")
 
     due_time = None
     if modo == "Retirar":
@@ -326,7 +441,6 @@ with tab_op:
             background_color="#FFFFFF",
             height=180, width=500, drawing_mode="freedraw", key="sig_out"
         )
-
         if st.button("Confirmar retirada", key="btn_checkout"):
             sig_bytes = None
             if canvas_out.image_data is not None:
@@ -335,15 +449,14 @@ with tab_op:
                     buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
                 except Exception:
                     sig_bytes = None
-            ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_phone, due_time, sig_bytes)
+            ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_by_phone, due_time, sig_bytes)
             if ok:
                 st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
             else:
                 st.error(msg)
-
-    else:  # Devolver
+    else:
         if not space_exists_and_active(int(key_number)):
-            st.error(f"A chave {int(key_number)} não está cadastrada/ativa. Cadastre ou ative em Cadastros → Espaços.")
+            st.error(f"A chave {int(key_number)} não está cadastrada/ativa. Cadastre/ative em Cadastros → Espaços.")
         else:
             st.caption("Assinatura – Devolução da chave")
             canvas_in = st_canvas(
@@ -375,40 +488,42 @@ if is_admin:
         st.dataframe(df_sp, use_container_width=True)
 
         st.markdown("**Adicionar/Atualizar espaço**")
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             sp_key = st.number_input("Nº da chave", min_value=1, step=1, key="space_key_add")
         with c2:
             sp_name = st.text_input("Nome da Sala/Lab", key="space_name_add")
         with c3:
             sp_loc = st.text_input("Localização (opcional)", key="space_loc_add")
-        c4, c5 = st.columns(2)
         with c4:
-            if st.button("Salvar/Atualizar espaço", key="space_save"):
-                if sp_name.strip():
-                    add_space(int(sp_key), sp_name.strip(), sp_loc.strip())
-                    st.success("Espaço salvo/atualizado.")
-                else:
-                    st.error("Informe o nome da Sala/Lab.")
-        with c5:
-            des_key = st.number_input("Ativar/Desativar - Nº da chave", min_value=1, step=1, key="space_key_status")
-            des_active = st.selectbox("Status", ["Ativar", "Desativar"], index=0, key="space_status_select")
-            if st.button("Aplicar status", key="space_status_apply"):
-                row = df_sp[df_sp["key_number"] == int(des_key)]
-                if row.empty:
-                    st.error("Chave não encontrada.")
-                else:
-                    update_space(int(des_key),
-                                 row.iloc[0]["room_name"],
-                                 row.iloc[0]["location"] or "",
-                                 1 if des_active == "Ativar" else 0)
-                    st.success("Status atualizado.")
+            sp_cat = st.selectbox("Categoria", ["Sala", "Laboratório", "Secretaria"], key="space_cat_add")
+        if st.button("Salvar/Atualizar espaço", key="space_save"):
+            if sp_name.strip():
+                add_space(int(sp_key), sp_name.strip(), sp_loc.strip(), sp_cat)
+                st.success("Espaço salvo/atualizado.")
+            else:
+                st.error("Informe o nome da Sala/Lab.")
 
         st.markdown("---")
-        st.caption("Atalho: criar chaves 1..50 (apenas nome genérico).")
+        des_key = st.number_input("Ativar/Desativar - Nº da chave", min_value=1, step=1, key="space_key_status")
+        des_active = st.selectbox("Status", ["Ativar", "Desativar"], index=0, key="space_status_select")
+        if st.button("Aplicar status", key="space_status_apply"):
+            row = df_sp[df_sp["key_number"] == int(des_key)]
+            if row.empty:
+                st.error("Chave não encontrada.")
+            else:
+                update_space(int(des_key),
+                             row.iloc[0]["room_name"],
+                             row.iloc[0]["location"] or "",
+                             1 if des_active == "Ativar" else 0,
+                             row.iloc[0].get("category", "Sala"))
+                st.success("Status atualizado.")
+
+        st.markdown("---")
+        st.caption("Atalho: criar chaves 1..50 (categoria 'Sala').")
         if st.button("Gerar 50 chaves padrão", key="space_generate_50"):
             for k in range(1, 51):
-                add_space(k, f"Sala/Lab {k}", "")
+                add_space(k, f"Sala/Lab {k}", "", "Sala")
             st.success("Criadas/atualizadas as chaves 1..50.")
 
         st.markdown("___")
@@ -444,6 +559,48 @@ if is_admin:
                 update_person(sel_pid, en.strip(), eidc.strip(), eph.strip(), 1 if est=="Ativo" else 0)
                 st.success("Responsável atualizado.")
 
+        st.markdown("___")
+        st.subheader("Autorizações por espaço")
+        df_sp_act = list_spaces(active_only=True)
+        if df_sp_act.empty:
+            st.info("Cadastre espaços ativos para criar autorizações.")
+        else:
+            key_sel = st.selectbox("Chave", options=df_sp_act["key_number"].tolist(), key="auth_key_sel")
+            memo = st.text_input("Nº do memorando/circular", key="auth_memo")
+            col_af, col_at = st.columns(2)
+            with col_af:
+                vf = st.date_input("Válido de (opcional)", key="auth_from")
+            with col_at:
+                vt = st.date_input("Válido até (opcional)", key="auth_to")
+            if st.button("Criar autorização", key="auth_create"):
+                aid = add_authorization(int(key_sel), memo.strip(), vf if vf else None, vt if vt else None)
+                st.success(f"Autorização criada: {aid}")
+
+            st.markdown("**Vincular pessoas à autorização**")
+            df_auths = list_authorizations(int(key_sel))
+            if df_auths.empty:
+                st.info("Nenhuma autorização criada para esta chave.")
+            else:
+                sel_auth = st.selectbox("Selecione a autorização", options=df_auths["id"].tolist(), key="auth_sel")
+                # pessoas ativas
+                dfp = list_persons(active_only=True)
+                if not dfp.empty:
+                    sel_people = st.multiselect("Adicionar pessoas (ativas)", options=dfp["name"].tolist(), key="auth_people_sel")
+                    if st.button("Adicionar à autorização", key="auth_people_add"):
+                        for nm in sel_people:
+                            pid = dfp[dfp["name"]==nm].iloc[0]["id"]
+                            add_person_to_authorization(sel_auth, pid)
+                        st.success("Pessoas adicionadas.")
+                # lista vinculados
+                c = conn()
+                df_link = pd.read_sql_query("""
+                    SELECT p.name, p.id_code, p.phone FROM persons p
+                    JOIN authorization_people ap ON ap.person_id = p.id
+                    WHERE ap.authorization_id=?
+                """, c, params=[sel_auth])
+                st.write("Vinculados:")
+                st.dataframe(df_link, use_container_width=True)
+
 # -------------- RELATÓRIOS (ADMIN) ----------
 if is_admin:
     with tab_rep:
@@ -463,13 +620,24 @@ if is_admin:
         em_uso = sum((pd.isna(df_tx["checkin_time"])))
         atrasadas = 0
         for _, r in df_tx.iterrows():
-            if pd.isna(r["checkin_time"]) and pd.notna(r["due_time"]):
-                try:
-                    due = datetime.datetime.fromisoformat(str(r["due_time"]))
-                    if datetime.datetime.now() > due:
-                        atrasadas += 1
-                except Exception:
-                    pass
+            if pd.isna(r["checkin_time"]):
+                if pd.notna(r["due_time"]):
+                    try:
+                        due = datetime.datetime.fromisoformat(str(r["due_time"]))
+                        if datetime.datetime.now() > due:
+                            atrasadas += 1
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        co = datetime.datetime.fromisoformat(str(r["checkout_time"]))
+                        limit = co.replace(hour=CUTOFF_HOUR_FOR_OVERDUE, minute=0, second=0, microsecond=0)
+                        if limit < co:
+                            limit = limit + datetime.timedelta(days=1)
+                        if datetime.datetime.now() > limit:
+                            atrasadas += 1
+                    except Exception:
+                        pass
         m1, m2, m3 = st.columns(3)
         m1.metric("Movimentações", total)
         m2.metric("Em uso (abertas)", em_uso)
@@ -517,3 +685,19 @@ if is_admin:
                             zf.writestr(fname, data)
                     buf.seek(0)
                     st.download_button("Baixar todas em ZIP", data=buf.read(), file_name="qrcodes_chaves.zip", key="qr_zip_btn")
+
+        st.markdown("---")
+        st.subheader("QR personalizado (pessoa específica)")
+        dfp_all = list_persons(active_only=True)
+        if dfp_all.empty or df_sp_act.empty:
+            st.info("Cadastre pessoas e espaços para gerar QR personalizado.")
+        else:
+            sel_key_personal = st.selectbox("Chave", options=df_sp_act["key_number"].tolist(), key="qr_pers_key")
+            sel_person = st.selectbox("Responsável", options=dfp_all["name"].tolist(), key="qr_pers_person")
+            pid_val = dfp_all[dfp_all["name"] == sel_person].iloc[0]["id"]
+            url_p = build_url(base_url, {"key": sel_key_personal, "action": "retirar", "pid": pid_val})
+            img_p = make_qr(url_p)
+            st.image(img_p, use_container_width=False)
+            st.caption(url_p)
+            st.download_button("Baixar QR (PNG)", data=to_png_bytes(img_p),
+                               file_name=f"qr_key{sel_key_personal}_{pid_val[:8]}.png", key="qr_pers_dl")
