@@ -1,7 +1,8 @@
 # ==========================================
-# Guarita - Controle de Chaves (Acesso público restrito + Devolução via QR)
+# Guarita - Controle de Chaves
+# (Acesso público restrito + Autorizações + Categorias + Atraso 23h + QR Retirada/Devolução + Token)
 # ==========================================
-import os, io, uuid, sqlite3, datetime, zipfile
+import os, io, uuid, sqlite3, datetime, zipfile, secrets, string
 from typing import Optional, Tuple, List
 import pandas as pd
 import streamlit as st
@@ -18,6 +19,7 @@ ADMIN_PASS = st.secrets.get("STREAMLIT_ADMIN_PASS", os.getenv("STREAMLIT_ADMIN_P
 SECRET_BASE_URL = st.secrets.get("BASE_URL", os.getenv("BASE_URL", "")).strip()
 DB_PATH = os.getenv("DB_PATH", "keys.db")
 CUTOFF_HOUR_FOR_OVERDUE = int(os.getenv("CUTOFF_HOUR_FOR_OVERDUE", "23"))  # atraso até 23:00
+TOKEN_TTL_MINUTES = int(os.getenv("TOKEN_TTL_MINUTES", "30"))  # validade padrão do token
 
 # -------------- Utilidades -----------------
 def now_iso():
@@ -40,10 +42,15 @@ def build_url(base_url: str, params: dict) -> str:
     query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None and v != "")
     return f"{base}/?{query}" if query else f"{base}/"
 
+def gen_token_str(n: int = 24) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(n))
+
 # -------------- Banco de Dados -------------
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("""PRAGMA foreign_keys = ON;""")
+    # spaces (+ category)
     c.execute("""
       CREATE TABLE IF NOT EXISTS spaces(
         key_number INTEGER PRIMARY KEY,
@@ -52,12 +59,12 @@ def conn():
         is_active  INTEGER DEFAULT 1
       )
     """)
-    # MIGRAÇÃO: category
     try:
         c.execute("ALTER TABLE spaces ADD COLUMN category TEXT DEFAULT 'Sala'")
     except Exception:
         pass
 
+    # persons
     c.execute("""
       CREATE TABLE IF NOT EXISTS persons(
         id TEXT PRIMARY KEY,
@@ -67,6 +74,8 @@ def conn():
         is_active INTEGER DEFAULT 1
       )
     """)
+
+    # transactions
     c.execute("""
       CREATE TABLE IF NOT EXISTS transactions(
         id TEXT PRIMARY KEY,
@@ -83,6 +92,8 @@ def conn():
         FOREIGN KEY (key_number) REFERENCES spaces(key_number)
       )
     """)
+
+    # authorizations
     c.execute("""
       CREATE TABLE IF NOT EXISTS authorizations(
         id TEXT PRIMARY KEY,
@@ -103,6 +114,21 @@ def conn():
         FOREIGN KEY (person_id) REFERENCES persons(id)
       )
     """)
+
+    # qr_tokens (uso único)
+    c.execute("""
+      CREATE TABLE IF NOT EXISTS qr_tokens(
+        token TEXT PRIMARY KEY,
+        action TEXT NOT NULL,         -- 'retirar' | 'devolver'
+        key_number INTEGER NOT NULL,
+        person_id TEXT,               -- opcional (obrigatório para retirar personalizada)
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (key_number) REFERENCES spaces(key_number),
+        FOREIGN KEY (person_id) REFERENCES persons(id)
+      )
+    """)
     return c
 
 # ----- Helpers: Spaces -----
@@ -110,8 +136,7 @@ def add_space(key_number: int, room_name: str, location: str = "", category: str
     c = conn()
     with c:
         c.execute("""INSERT OR REPLACE INTO spaces(key_number,room_name,location,is_active,category)
-                     VALUES(?,?,?,?,?)""",
-                  (key_number, room_name, location, 1, category))
+                     VALUES(?,?,?,?,?)""", (key_number, room_name, location, 1, category))
 
 def list_spaces(active_only=True):
     c = conn()
@@ -150,6 +175,12 @@ def update_person(pid: str, name: str, id_code: str, phone: str, is_active: int)
         c.execute("UPDATE persons SET name=?, id_code=?, phone=?, is_active=? WHERE id=?",
                   (name, id_code, phone, int(is_active), pid))
 
+def get_person(pid: str) -> Optional[pd.Series]:
+    df = list_persons(active_only=False)
+    if df.empty: return None
+    row = df[df["id"] == pid]
+    return None if row.empty else row.iloc[0]
+
 # ----- Helpers: Autorizações -----
 def add_authorization(key_number:int, memo_number:str, valid_from:Optional[datetime.date], valid_to:Optional[datetime.date]) -> str:
     c = conn(); aid = str(uuid.uuid4())
@@ -164,8 +195,7 @@ def add_authorization(key_number:int, memo_number:str, valid_from:Optional[datet
 
 def list_authorizations(key_number:int=None) -> pd.DataFrame:
     c = conn()
-    q = "SELECT * FROM authorizations"
-    p = []
+    q = "SELECT * FROM authorizations"; p = []
     if key_number is not None:
         q += " WHERE key_number=?"; p.append(key_number)
     q += " ORDER BY created_at DESC"
@@ -191,6 +221,47 @@ def list_authorized_people_now(key_number:int) -> pd.DataFrame:
       AND p.is_active = 1
     """
     return pd.read_sql_query(q, c, params=[key_number, now, now])
+
+# ----- Helpers: Tokens -----
+def create_qr_token(action: str, key_number: int, person_id: Optional[str], ttl_minutes: int = TOKEN_TTL_MINUTES) -> Tuple[str, datetime.datetime]:
+    assert action in ("retirar", "devolver")
+    token = gen_token_str(28)
+    exp = datetime.datetime.now() + datetime.timedelta(minutes=int(ttl_minutes))
+    c = conn()
+    with c:
+        c.execute("""INSERT INTO qr_tokens(token, action, key_number, person_id, expires_at, used_at, created_at)
+                     VALUES(?,?,?,?,?,?,?)""",
+                  (token, action, key_number, person_id, exp.isoformat(timespec="seconds"), None, now_iso()))
+    return token, exp
+
+def validate_qr_token(token: str, action: str, key_number: int, person_id: Optional[str] = None) -> Tuple[bool, str]:
+    """Valida sem consumir; retorna (ok, msg_erro)."""
+    c = conn()
+    cur = c.cursor()
+    cur.execute("""SELECT action, key_number, person_id, expires_at, used_at FROM qr_tokens WHERE token=?""", (token,))
+    row = cur.fetchone()
+    if not row:
+        return False, "Token inválido."
+    act, keyn, pid, exp, used = row
+    if act != action:
+        return False, "Token não corresponde a esta operação."
+    if int(keyn) != int(key_number):
+        return False, "Token não corresponde a esta chave."
+    if person_id is not None and pid != person_id:
+        return False, "Token não corresponde à pessoa autorizada."
+    try:
+        if used is not None:
+            return False, "Token já utilizado."
+        if datetime.datetime.now() > datetime.datetime.fromisoformat(str(exp)):
+            return False, "Token expirado."
+    except Exception:
+        return False, "Falha ao validar o token."
+    return True, ""
+
+def consume_qr_token(token: str):
+    c = conn()
+    with c:
+        c.execute("UPDATE qr_tokens SET used_at=? WHERE token=? AND used_at IS NULL", (now_iso(), token))
 
 # ----- Operação / Transactions -----
 def has_open_checkout(key_number: int) -> bool:
@@ -269,10 +340,8 @@ def list_status() -> pd.DataFrame:
             try:
                 co = datetime.datetime.fromisoformat(str(row["checkout_time"]))
                 limit = co.replace(hour=CUTOFF_HOUR_FOR_OVERDUE, minute=0, second=0, microsecond=0)
-                if limit < co:
-                    limit = limit + datetime.timedelta(days=1)
-                if now > limit:
-                    return "ATRASADA"
+                if limit < co: limit = limit + datetime.timedelta(days=1)
+                if now > limit: return "ATRASADA"
             except Exception:
                 pass
             return "EM_USO"
@@ -284,15 +353,11 @@ def list_status() -> pd.DataFrame:
 def list_transactions(start: Optional[datetime.datetime] = None,
                       end: Optional[datetime.datetime] = None) -> pd.DataFrame:
     c = conn()
-    base_q = "SELECT * FROM transactions"
-    params: List[str] = []
-    where = []
+    base_q = "SELECT * FROM transactions"; params: List[str] = []; where = []
     if start:
-        where.append("datetime(checkout_time) >= datetime(?)")
-        params.append(start.isoformat(timespec="seconds"))
+        where.append("datetime(checkout_time) >= datetime(?)"); params.append(start.isoformat(timespec="seconds"))
     if end:
-        where.append("datetime(COALESCE(checkin_time, checkout_time)) <= datetime(?)")
-        params.append(end.isoformat(timespec="seconds"))
+        where.append("datetime(COALESCE(checkin_time, checkout_time)) <= datetime(?)"); params.append(end.isoformat(timespec="seconds"))
     if where:
         base_q += " WHERE " + " AND ".join(where)
     base_q += " ORDER BY checkout_time DESC"
@@ -304,12 +369,12 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.header("Acesso")
     typed_pass = st.text_input("Senha de admin", type="password", key="admin_pass",
-                               help="Necessária para cadastrar/editar/exportar/gerar QRs e operar retiradas.")
+                               help="Necessária para operar retiradas/devoluções, cadastros e QRs.")
     is_admin = (ADMIN_PASS != "" and typed_pass == ADMIN_PASS)
     if ADMIN_PASS and is_admin:
         st.success("Admin autenticado.")
     elif ADMIN_PASS and not is_admin:
-        st.caption("Modo público: sem operações; apenas relatórios. Devolução apenas via QR.")
+        st.caption("Modo público: sem operações; relatórios e devolução/retirada apenas via QR com token.")
     else:
         st.info("Nenhuma senha configurada. Defina STREAMLIT_ADMIN_PASS em Secrets (produção).")
 
@@ -322,21 +387,30 @@ with st.sidebar:
         base_url = st.text_input("Base URL (para QRs)", value="http://localhost:8501", key="qr_base_url",
                                  help="Defina BASE_URL em Secrets para fixar permanentemente.")
 
-# Query params (?key=12&action=devolver&pid=<person_id>)
+# Query params (?key=12&action=devolver|retirar&pid=<person_id>&token=...)
 qp = st.query_params
-qp_key = qp.get("key"); qp_key = qp_key[0] if isinstance(qp_key, list) else qp_key
-qp_action = qp.get("action"); qp_action = qp_action[0] if isinstance(qp_action, list) else qp_action
-if qp_action not in ("retirar", "devolver", "info"): qp_action = None
-qp_pid = qp.get("pid"); qp_pid = qp_pid[0] if isinstance(qp_pid, list) else qp_pid
+def _get1(x):
+    return x[0] if isinstance(x, list) else x
+qp_key    = _get1(qp.get("key"))
+qp_action = _get1(qp.get("action"))
+qp_pid    = _get1(qp.get("pid"))
+qp_token  = _get1(qp.get("token"))
 
-# Público acessando link de devolução?
-public_qr_return = (not is_admin) and (qp_action == "devolver") and qp_key and str(qp_key).isdigit()
+if qp_action not in ("retirar", "devolver", "info"):
+    qp_action = None
+
+public_qr_return  = (not is_admin) and (qp_action == "devolver") and qp_key and str(qp_key).isdigit()
+public_qr_checkout = (not is_admin) and (qp_action == "retirar")  and qp_key and str(qp_key).isdigit() and qp_pid
 
 # -------------- Abas principais --------------
 if is_admin:
     tab_op, tab_cad, tab_rep, tab_qr = st.tabs(["Operação (Gestor)", "Cadastros (Admin)", "Relatórios (Admin)", "QR Codes (Admin)"])
 else:
-    if public_qr_return:
+    if public_qr_checkout and public_qr_return:
+        tab_pub_checkout, tab_pub_return, tab_pub = st.tabs(["Retirada (QR)", "Devolução (QR)", "Relatórios públicos"])
+    elif public_qr_checkout:
+        tab_pub_checkout, tab_pub = st.tabs(["Retirada (QR)", "Relatórios públicos"])
+    elif public_qr_return:
         tab_pub_return, tab_pub = st.tabs(["Devolução (QR)", "Relatórios públicos"])
     else:
         tab_pub, = st.tabs(["Relatórios públicos"])
@@ -370,16 +444,15 @@ if is_admin:
         df_spaces_all = list_spaces(active_only=False)
         room_info = df_spaces_all[df_spaces_all["key_number"] == int(key_number)]
         if not room_info.empty:
-            rn = room_info.iloc[0]["room_name"]
-            loc = room_info.iloc[0]["location"] or ""
+            rn = room_info.iloc[0]["room_name"]; loc = room_info.iloc[0]["location"] or ""
             cat = room_info.iloc[0]["category"] or "Sala"
             st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}  •  Categoria: {cat}")
 
-        # Autorizados vigentes (se houver) — restringe a lista
+        # Autorizados vigentes (se houver)
         df_authorized_now = list_authorized_people_now(int(key_number))
         df_persons = df_authorized_now if not df_authorized_now.empty else list_persons(active_only=True)
 
-        # Dados do responsável (QR personalizado opcional)
+        # Dados do responsável
         prefilled = None
         if qp_pid and not df_persons.empty and (df_persons["id"] == qp_pid).any():
             prow = df_persons[df_persons["id"] == qp_pid].iloc[0]
@@ -389,7 +462,7 @@ if is_admin:
         use_registry = st.checkbox("Usar cadastro de responsável", value=True, key="op_use_registry")
 
         if prefilled:
-            st.info(f"QR personalizado para **{prefilled['name']}**")
+            st.info(f"Pré-carregado: **{prefilled['name']}**")
             taken_by_name = st.text_input("Nome de quem pegou", value=prefilled["name"], key="op_nome_pref", disabled=True)
             taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=prefilled["id_code"], key="op_idcode_pref", disabled=True)
             taken_by_phone= st.text_input("Telefone", value=prefilled["phone"], key="op_phone_pref", disabled=True)
@@ -423,35 +496,60 @@ if is_admin:
             else:
                 due_time = None
 
-        # Assinaturas e botões (GESTOR)
+        # Assinaturas e botões
         if modo == "Retirar":
-            st.caption("Assinatura – Entrega da chave")
+            st.caption("Assinatura – Entrega da chave (Gestor)")
             canvas_out = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=2,
-                stroke_color="#000000",
-                background_color="#FFFFFF",
-                height=180, width=500, drawing_mode="freedraw", key="sig_out"
+                fill_color="rgba(0, 0, 0, 0)", stroke_width=2, stroke_color="#000000",
+                background_color="#FFFFFF", height=180, width=500, drawing_mode="freedraw", key="sig_out"
             )
-            if st.button("Confirmar retirada", key="btn_checkout"):
-                sig_bytes = None
-                if canvas_out.image_data is not None:
-                    try:
-                        img = Image.fromarray((canvas_out.image_data).astype("uint8"))
-                        buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
-                    except Exception:
-                        sig_bytes = None
-                ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_by_phone, due_time, sig_bytes)
-                if ok: st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
-                else:  st.error(msg)
+            col_g, col_t = st.columns([1,1])
+            with col_g:
+                if st.button("Confirmar retirada", key="btn_checkout"):
+                    sig_bytes = None
+                    if canvas_out.image_data is not None:
+                        try:
+                            img = Image.fromarray((canvas_out.image_data).astype("uint8"))
+                            buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
+                        except Exception:
+                            sig_bytes = None
+                    ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_by_phone, due_time, sig_bytes)
+                    if ok: st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
+                    else:  st.error(msg)
+            with col_t:
+                st.markdown("**QR de Retirada (pessoa específica, token)**")
+                # exige pessoa selecionada (ou prefilled)
+                person_for_qr = None
+                if prefilled:
+                    # localmente "prefilled" vem de qp_pid; mas para QR precisamos do id
+                    # como gestor: buscar pelo nome selecionado também não dá o id; então exigimos seleção abaixo:
+                    pass
+                dfp_all = list_persons(active_only=True)
+                if dfp_all.empty:
+                    st.info("Cadastre pessoas para gerar QR de retirada.")
+                else:
+                    sel_p_for_qr = st.selectbox("Pessoa", options=dfp_all["name"].tolist(), key="qr_checkout_person_admin")
+                    pid_val2 = dfp_all[dfp_all["name"] == sel_p_for_qr].iloc[0]["id"]
+                    # checa autorização vigente opcional
+                    df_auth_now = list_authorized_people_now(int(key_number))
+                    if not df_auth_now.empty and not (df_auth_now["id"] == pid_val2).any():
+                        st.warning("Pessoa não consta autorizada agora para esta chave (cadastre em Autorizações).")
+                    if st.button("Gerar QR de Retirada (token único)", key="qr_checkout_make"):
+                        token, exp = create_qr_token("retirar", int(key_number), pid_val2, TOKEN_TTL_MINUTES)
+                        url_checkout = build_url(base_url, {"key": int(key_number), "action": "retirar", "pid": pid_val2, "token": token})
+                        img_checkout = make_qr(url_checkout)
+                        st.image(img_checkout, use_container_width=False)
+                        st.caption(url_checkout)
+                        st.caption(f"Expira: {exp.strftime('%d/%m/%Y %H:%M')} (validade {TOKEN_TTL_MINUTES} min)")
+                        st.download_button("Baixar QR (PNG)", data=to_png_bytes(img_checkout),
+                                           file_name=f"qr_retirar_key{int(key_number)}_{pid_val2[:8]}.png",
+                                           key="qr_checkout_dl")
+
         else:
             st.caption("Assinatura – Devolução da chave (Gestor)")
             canvas_in = st_canvas(
-                fill_color="rgba(0, 0, 0, 0)",
-                stroke_width=2,
-                stroke_color="#000000",
-                background_color="#FFFFFF",
-                height=180, width=500, drawing_mode="freedraw", key="sig_in"
+                fill_color="rgba(0, 0, 0, 0)", stroke_width=2, stroke_color="#000000",
+                background_color="#FFFFFF", height=180, width=500, drawing_mode="freedraw", key="sig_in"
             )
             if st.button("Confirmar devolução", key="btn_checkin"):
                 sig_bytes = None
@@ -481,33 +579,34 @@ def render_public_reports():
     st.markdown("---")
     st.subheader("Últimas movimentações")
     df_tx = list_transactions()
-    # mostra um resumo (sem blobs)
     cols = ["key_number","taken_by_name","checkout_time","due_time","checkin_time","status"]
     cols = [c for c in cols if c in df_tx.columns]
     st.dataframe(df_tx[cols].head(200), use_container_width=True)
 
 # -------------- DEVOLUÇÃO VIA QR (PÚBLICO) ---
-def render_public_qr_return(qkey: int):
+def render_public_qr_return(qkey: int, token: Optional[str]):
     st.subheader("Devolução de chave (via QR)")
     if not space_exists_and_active(qkey):
-        st.error("Chave não cadastrada/ativa. Procure a guarita.")
-        return
+        st.error("Chave não cadastrada/ativa. Procure a guarita."); return
+
+    # Se vier token, valida (opcional)
+    if token:
+        ok, msg = validate_qr_token(token, "devolver", qkey, None)
+        if not ok:
+            st.error(msg); return
+
     # Info do espaço
     df_spaces_all = list_spaces(active_only=False)
     room_info = df_spaces_all[df_spaces_all["key_number"] == int(qkey)]
     if not room_info.empty:
-        rn = room_info.iloc[0]["room_name"]
-        loc = room_info.iloc[0]["location"] or ""
+        rn = room_info.iloc[0]["room_name"]; loc = room_info.iloc[0]["location"] or ""
         cat = room_info.iloc[0]["category"] or "Sala"
         st.caption(f"Chave **{qkey}** • {rn} • {loc} • {cat}")
 
     st.caption("Assine para confirmar a devolução")
     canvas_in = st_canvas(
-        fill_color="rgba(0, 0, 0, 0)",
-        stroke_width=2,
-        stroke_color="#000000",
-        background_color="#FFFFFF",
-        height=180, width=500, drawing_mode="freedraw", key="sig_in_public"
+        fill_color="rgba(0, 0, 0, 0)", stroke_width=2, stroke_color="#000000",
+        background_color="#FFFFFF", height=180, width=500, drawing_mode="freedraw", key="sig_in_public"
     )
     if st.button("Confirmar devolução", key="btn_checkin_public"):
         sig_bytes = None
@@ -518,8 +617,74 @@ def render_public_qr_return(qkey: int):
             except Exception:
                 sig_bytes = None
         ok, msg = do_checkin(int(qkey), sig_bytes)
-        if ok: st.success(f"Chave {int(qkey)} devolvida. Protocolo: {msg}")
-        else:  st.error(msg)
+        if ok:
+            # consome token (se houver)
+            if token: consume_qr_token(token)
+            st.success(f"Chave {int(qkey)} devolvida. Protocolo: {msg}")
+        else:
+            st.error(msg)
+
+# -------------- RETIRADA VIA QR (PÚBLICO) ----
+def render_public_qr_checkout(qkey: int, pid: str, token: Optional[str]):
+    """Tela pública para RETIRADA via QR com pessoa específica (pid) e token obrigatório."""
+    if not space_exists_and_active(qkey):
+        st.error("Chave não cadastrada/ativa. Procure a guarita."); return
+
+    # Valida token (obrigatório na retirada)
+    if not token:
+        st.error("Token ausente. Solicite um novo QR na guarita."); return
+    ok, msg = validate_qr_token(token, "retirar", qkey, pid)
+    if not ok:
+        st.error(msg); return
+
+    # Busca pessoa e valida autorização vigente
+    df_auth_now = list_authorized_people_now(qkey)
+    if df_auth_now.empty or not (df_auth_now["id"] == pid).any():
+        st.error("Você não está autorizado(a) a retirar esta chave neste período. Procure a guarita.")
+        return
+    prow = df_auth_now[df_auth_now["id"] == pid].iloc[0]
+
+    # Info do espaço
+    df_spaces_all = list_spaces(active_only=False)
+    room_info = df_spaces_all[df_spaces_all["key_number"] == int(qkey)]
+    if not room_info.empty:
+        rn = room_info.iloc[0]["room_name"]; loc = room_info.iloc[0]["location"] or ""
+        cat = room_info.iloc[0]["category"] or "Sala"
+        st.subheader("Retirada de chave (via QR)")
+        st.caption(f"Chave **{qkey}** • {rn} • {loc} • {cat}")
+
+    st.markdown("**Responsável**")
+    taken_by_name  = st.text_input("Nome", value=prow["name"], disabled=True)
+    taken_by_id    = st.text_input("Matrícula SIAPE / ID estudante", value=prow["id_code"], disabled=True)
+    taken_by_phone = st.text_input("Telefone", value=prow["phone"], disabled=True)
+
+    # Prazo simples (opcional)
+    st.markdown("**Prazo de devolução (opcional)**")
+    due_opt = st.selectbox("Prazo", ["Hoje 18:00", "Sem prazo"], index=0)
+    if due_opt == "Hoje 18:00":
+        today = datetime.date.today(); due_time = datetime.datetime.combine(today, datetime.time(18,0))
+    else:
+        due_time = None
+
+    st.caption("Assinatura – Confirmação de retirada")
+    canvas_out = st_canvas(
+        fill_color="rgba(0, 0, 0, 0)", stroke_width=2, stroke_color="#000000",
+        background_color="#FFFFFF", height=180, width=500, drawing_mode="freedraw", key="sig_out_public"
+    )
+    if st.button("Confirmar retirada", key="btn_checkout_public"):
+        sig_bytes = None
+        if canvas_out.image_data is not None:
+            try:
+                img = Image.fromarray((canvas_out.image_data).astype("uint8"))
+                buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
+            except Exception:
+                sig_bytes = None
+        ok, msg = open_checkout(int(qkey), prow["name"], prow["id_code"], prow["phone"], due_time, sig_bytes)
+        if ok:
+            consume_qr_token(token)  # consome token após sucesso
+            st.success(f"Retirada registrada. Protocolo: {msg}")
+        else:
+            st.error(msg)
 
 # -------------- CADASTROS (ADMIN) -----------
 if is_admin:
@@ -674,19 +839,16 @@ if is_admin:
 # -------------- QR CODES (ADMIN) ------------
 if is_admin:
     with tab_qr:
-        st.subheader("QR Codes por chave")
+        st.subheader("QR Codes por chave (público)")
         if not base_url: st.error("Defina a BASE_URL (em Secrets ou na sidebar) para gerar QRs públicos.")
         df_sp_act = list_spaces(active_only=True)
         if df_sp_act.empty:
             st.info("Nenhuma chave ativa cadastrada.")
         else:
+            use_token_return = st.checkbox("Gerar QR de Devolução com token de uso único", value=False, key="qr_return_use_token")
             ids = st.multiselect("Selecione as chaves", options=df_sp_act["key_number"].tolist(),
                                  default=df_sp_act["key_number"].tolist()[:12], key="qr_ids")
             cols = st.number_input("Cartões por linha (sug.: 4)", min_value=1, max_value=6, value=4, key="qr_cols")
-            modo_qr = st.selectbox("Ação padrão ao abrir o QR", ["Somente info", "Retirar", "Devolver"], key="qr_action")
-            action_map = {"Somente info":"info", "Retirar":"retirar", "Devolver":"devolver"}
-            action = action_map[modo_qr]
-
             images_for_zip = []
             if ids:
                 rows = (len(ids) + cols - 1) // cols
@@ -694,11 +856,17 @@ if is_admin:
                     cset = st.columns(int(cols))
                     for c, keyn in enumerate(ids[r*int(cols):(r+1)*int(cols)]):
                         with cset[c]:
-                            room = df_sp_act[df_sp_act["key_number"] == keyn].iloc[0]["room_name"]
-                            url = build_url(base_url, {"key": keyn, "action": action})
+                            if use_token_return:
+                                token, exp = create_qr_token("devolver", int(keyn), None, TOKEN_TTL_MINUTES)
+                                url = build_url(base_url, {"key": keyn, "action": "devolver", "token": token})
+                                exp_txt = f" (expira {exp.strftime('%d/%m %H:%M')})"
+                            else:
+                                url = build_url(base_url, {"key": keyn, "action": "devolver"})
+                                exp_txt = ""
                             img = make_qr(url)
                             st.image(img, use_container_width=True)
-                            st.caption(f"Chave {keyn} — {room}")
+                            room = df_sp_act[df_sp_act["key_number"] == keyn].iloc[0]["room_name"]
+                            st.caption(f"Chave {keyn} — {room}{exp_txt}")
                             st.caption(url)
                             images_for_zip.append((f"chave_{keyn}.png", to_png_bytes(img)))
 
@@ -710,29 +878,38 @@ if is_admin:
                     st.download_button("Baixar todas em ZIP", data=buf.read(), file_name="qrcodes_chaves.zip", key="qr_zip_btn")
 
         st.markdown("---")
-        st.subheader("QR personalizado (pessoa específica)")
+        st.subheader("QR de Retirada (pessoa específica, com token)")
         dfp_all = list_persons(active_only=True)
         if dfp_all.empty or df_sp_act.empty:
-            st.info("Cadastre pessoas e espaços para gerar QR personalizado.")
+            st.info("Cadastre pessoas e espaços para gerar QR de retirada.")
         else:
-            sel_key_personal = st.selectbox("Chave", options=df_sp_act["key_number"].tolist(), key="qr_pers_key")
-            sel_person = st.selectbox("Responsável", options=dfp_all["name"].tolist(), key="qr_pers_person")
-            pid_val = dfp_all[dfp_all["name"] == sel_person].iloc[0]["id"]
-            url_p = build_url(base_url, {"key": sel_key_personal, "action": "devolver"})  # para público devolver
-            # Se quiser um QR que pré-preencha retirada para gestor, troque action por "retirar" e use no posto.
-            img_p = make_qr(url_p)
-            st.image(img_p, use_container_width=False)
-            st.caption(url_p)
-            st.download_button("Baixar QR (PNG)", data=to_png_bytes(img_p),
-                               file_name=f"qr_key{sel_key_personal}_{pid_val[:8]}.png", key="qr_pers_dl")
+            sel_key_checkout = st.selectbox("Chave (retirada)", options=df_sp_act["key_number"].tolist(), key="qr_checkout_key_admin")
+            sel_person_checkout = st.selectbox("Responsável (retirada)", options=dfp_all["name"].tolist(), key="qr_checkout_person_admin2")
+            pid_val2 = dfp_all[dfp_all["name"] == sel_person_checkout].iloc[0]["id"]
+            if st.button("Gerar QR de Retirada (token único)", key="qr_checkout_make_admin"):
+                token, exp = create_qr_token("retirar", int(sel_key_checkout), pid_val2, TOKEN_TTL_MINUTES)
+                url_checkout = build_url(base_url, {"key": int(sel_key_checkout), "action": "retirar", "pid": pid_val2, "token": token})
+                img_checkout = make_qr(url_checkout)
+                st.image(img_checkout, use_container_width=False)
+                st.caption(url_checkout)
+                st.caption(f"Expira: {exp.strftime('%d/%m/%Y %H:%M')} (validade {TOKEN_TTL_MINUTES} min)")
+                st.download_button("Baixar QR (PNG)", data=to_png_bytes(img_checkout),
+                                   file_name=f"qr_retirar_key{int(sel_key_checkout)}_{pid_val2[:8]}.png",
+                                   key="qr_checkout_dl_admin")
+
+# -------------- PÚBLICO: RETIRADA VIA QR ----
+if (not is_admin) and public_qr_checkout:
+    with tab_pub_checkout:
+        render_public_qr_checkout(int(qp_key), qp_pid, qp_token)
 
 # -------------- PÚBLICO: DEVOLUÇÃO VIA QR ---
 if (not is_admin) and public_qr_return:
     with tab_pub_return:
-        render_public_qr_return(int(qp_key))
+        render_public_qr_return(int(qp_key), qp_token)
 
 # -------------- PÚBLICO: RELATÓRIOS ----------
 if (not is_admin):
-    with (tab_pub if public_qr_return else tab_pub):
+    with tab_pub:
         render_public_reports()
+
 
