@@ -1,5 +1,5 @@
 # ==========================================
-# Guarita - Controle de Chaves (Completo + Autorizações + Categorias + Atraso 23h)
+# Guarita - Controle de Chaves (Acesso público restrito + Devolução via QR)
 # ==========================================
 import os, io, uuid, sqlite3, datetime, zipfile
 from typing import Optional, Tuple, List
@@ -17,9 +17,7 @@ APP_TITLE = "Guarita – Controle de Chaves"
 ADMIN_PASS = st.secrets.get("STREAMLIT_ADMIN_PASS", os.getenv("STREAMLIT_ADMIN_PASS", ""))
 SECRET_BASE_URL = st.secrets.get("BASE_URL", os.getenv("BASE_URL", "")).strip()
 DB_PATH = os.getenv("DB_PATH", "keys.db")
-
-# Corte para atraso "até 23:00 do dia" (padrão 23)
-CUTOFF_HOUR_FOR_OVERDUE = int(os.getenv("CUTOFF_HOUR_FOR_OVERDUE", "23"))
+CUTOFF_HOUR_FOR_OVERDUE = int(os.getenv("CUTOFF_HOUR_FOR_OVERDUE", "23"))  # atraso até 23:00
 
 # -------------- Utilidades -----------------
 def now_iso():
@@ -27,8 +25,7 @@ def now_iso():
 
 def to_png_bytes(img: Image.Image) -> bytes:
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
+    img.save(buf, format="PNG"); buf.seek(0)
     return buf.read()
 
 def make_qr(data: str) -> Image.Image:
@@ -39,8 +36,7 @@ def make_qr(data: str) -> Image.Image:
 
 def build_url(base_url: str, params: dict) -> str:
     base = (base_url or "").rstrip("/")
-    if not base:
-        return ""
+    if not base: return ""
     query = "&".join(f"{k}={v}" for k, v in params.items() if v is not None and v != "")
     return f"{base}/?{query}" if query else f"{base}/"
 
@@ -48,7 +44,6 @@ def build_url(base_url: str, params: dict) -> str:
 def conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("""PRAGMA foreign_keys = ON;""")
-    # spaces (adicionamos category por migração)
     c.execute("""
       CREATE TABLE IF NOT EXISTS spaces(
         key_number INTEGER PRIMARY KEY,
@@ -57,7 +52,7 @@ def conn():
         is_active  INTEGER DEFAULT 1
       )
     """)
-    # MIGRAÇÃO: coluna category
+    # MIGRAÇÃO: category
     try:
         c.execute("ALTER TABLE spaces ADD COLUMN category TEXT DEFAULT 'Sala'")
     except Exception:
@@ -88,7 +83,6 @@ def conn():
         FOREIGN KEY (key_number) REFERENCES spaces(key_number)
       )
     """)
-    # Autorizações
     c.execute("""
       CREATE TABLE IF NOT EXISTS authorizations(
         id TEXT PRIMARY KEY,
@@ -173,8 +167,7 @@ def list_authorizations(key_number:int=None) -> pd.DataFrame:
     q = "SELECT * FROM authorizations"
     p = []
     if key_number is not None:
-        q += " WHERE key_number=?"
-        p.append(key_number)
+        q += " WHERE key_number=?"; p.append(key_number)
     q += " ORDER BY created_at DESC"
     return pd.read_sql_query(q, c, params=p)
 
@@ -185,7 +178,6 @@ def add_person_to_authorization(authorization_id:str, person_id:str):
                      VALUES(?,?,?)""", (str(uuid.uuid4()), authorization_id, person_id))
 
 def list_authorized_people_now(key_number:int) -> pd.DataFrame:
-    """Retorna pessoas autorizadas para esta chave no momento atual."""
     c = conn()
     now = now_iso()
     q = """
@@ -312,14 +304,14 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.header("Acesso")
     typed_pass = st.text_input("Senha de admin", type="password", key="admin_pass",
-                               help="Necessária para cadastrar/editar/exportar/gerar QRs.")
+                               help="Necessária para cadastrar/editar/exportar/gerar QRs e operar retiradas.")
     is_admin = (ADMIN_PASS != "" and typed_pass == ADMIN_PASS)
     if ADMIN_PASS and is_admin:
         st.success("Admin autenticado.")
     elif ADMIN_PASS and not is_admin:
-        st.caption("Modo operador/público: operação permitida; cadastros/relatórios/QRs completos só com senha.")
+        st.caption("Modo público: sem operações; apenas relatórios. Devolução apenas via QR.")
     else:
-        st.info("Nenhuma senha configurada. Defina STREAMLIT_ADMIN_PASS em Secrets.")
+        st.info("Nenhuma senha configurada. Defina STREAMLIT_ADMIN_PASS em Secrets (produção).")
 
 with st.sidebar:
     st.header("Configuração de QR")
@@ -332,133 +324,128 @@ with st.sidebar:
 
 # Query params (?key=12&action=devolver&pid=<person_id>)
 qp = st.query_params
-qp_key = qp.get("key")
-if isinstance(qp_key, list): qp_key = qp_key[0]
-qp_action = qp.get("action")
-if isinstance(qp_action, list): qp_action = qp_action[0]
+qp_key = qp.get("key"); qp_key = qp_key[0] if isinstance(qp_key, list) else qp_key
+qp_action = qp.get("action"); qp_action = qp_action[0] if isinstance(qp_action, list) else qp_action
 if qp_action not in ("retirar", "devolver", "info"): qp_action = None
-qp_pid = qp.get("pid")
-if isinstance(qp_pid, list): qp_pid = qp_pid[0]
+qp_pid = qp.get("pid"); qp_pid = qp_pid[0] if isinstance(qp_pid, list) else qp_pid
+
+# Público acessando link de devolução?
+public_qr_return = (not is_admin) and (qp_action == "devolver") and qp_key and str(qp_key).isdigit()
 
 # -------------- Abas principais --------------
 if is_admin:
-    tab_op, tab_cad, tab_rep, tab_qr = st.tabs(["Operação", "Cadastros (Admin)", "Relatórios (Admin)", "QR Codes (Admin)"])
+    tab_op, tab_cad, tab_rep, tab_qr = st.tabs(["Operação (Gestor)", "Cadastros (Admin)", "Relatórios (Admin)", "QR Codes (Admin)"])
 else:
-    tab_op, = st.tabs(["Operação"])
-
-# -------------- OPERAÇÃO ---------------------
-with tab_op:
-    st.subheader("Status das chaves")
-    cats = ["Todas", "Sala", "Laboratório", "Secretaria"]
-    sel_cat = st.selectbox("Filtrar por categoria", cats, index=0, key="op_cat")
-    df_status = list_status()
-    if sel_cat != "Todas":
-        df_status = df_status[df_status["category"] == sel_cat]
-    st.dataframe(df_status, use_container_width=True)
-    num_atraso = (df_status["status"] == "ATRASADA").sum()
-    if num_atraso:
-        st.error(f"⚠️ {num_atraso} chave(s) ATRASADA(s).")
-
-    st.markdown("---")
-    st.subheader("Retirar / Devolver")
-
-    modos = ["Retirar", "Devolver"]
-    default_idx = 0 if (qp_action in (None, "retirar")) else 1
-    modo = st.radio("Ação", modos, horizontal=True, index=default_idx, key="op_modo")
-
-    default_key = int(qp_key) if (qp_key and str(qp_key).isdigit()) else None
-    key_number = st.number_input("Nº da chave", min_value=1, step=1,
-                                 value=default_key if default_key else 1, key="op_keynum")
-
-    # Info do espaço
-    df_spaces_all = list_spaces(active_only=False)
-    room_info = df_spaces_all[df_spaces_all["key_number"] == int(key_number)]
-    if not room_info.empty:
-        rn = room_info.iloc[0]["room_name"]
-        loc = room_info.iloc[0]["location"] or ""
-        cat = room_info.iloc[0]["category"] or "Sala"
-        st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}  •  Categoria: {cat}")
-
-    # Autorizados vigentes (se houver) — restringe a lista
-    df_authorized_now = list_authorized_people_now(int(key_number))
-    if df_authorized_now.empty:
-        st.warning("⚠️ Não há autorização vigente para esta chave. (Admin pode cadastrar em Cadastros → Autorizações)")
-        df_persons = list_persons(active_only=True)
+    if public_qr_return:
+        tab_pub_return, tab_pub = st.tabs(["Devolução (QR)", "Relatórios públicos"])
     else:
-        df_persons = df_authorized_now
+        tab_pub, = st.tabs(["Relatórios públicos"])
 
-    # Dados do responsável (com QR personalizado via pid)
-    prefilled = None
-    if qp_pid and not df_persons.empty and (df_persons["id"] == qp_pid).any():
-        prow = df_persons[df_persons["id"] == qp_pid].iloc[0]
-        prefilled = {"name": prow["name"], "id_code": prow["id_code"], "phone": prow["phone"]}
+# -------------- OPERAÇÃO (somente gestor) ---
+if is_admin:
+    with tab_op:
+        st.subheader("Status das chaves")
+        cats = ["Todas", "Sala", "Laboratório", "Secretaria"]
+        sel_cat = st.selectbox("Filtrar por categoria", cats, index=0, key="op_cat")
+        df_status = list_status()
+        if sel_cat != "Todas":
+            df_status = df_status[df_status["category"] == sel_cat]
+        st.dataframe(df_status, use_container_width=True)
+        num_atraso = (df_status["status"] == "ATRASADA").sum()
+        if num_atraso:
+            st.error(f"⚠️ {num_atraso} chave(s) ATRASADA(s).")
 
-    st.markdown("**Dados do responsável**")
-    use_registry = st.checkbox("Usar cadastro de responsável", value=True, key="op_use_registry")
+        st.markdown("---")
+        st.subheader("Retirar / Devolver (Gestor)")
 
-    if prefilled:
-        st.info(f"QR personalizado para **{prefilled['name']}**")
-        taken_by_name = st.text_input("Nome de quem pegou", value=prefilled["name"], key="op_nome_pref", disabled=True)
-        taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=prefilled["id_code"], key="op_idcode_pref", disabled=True)
-        taken_by_phone = st.text_input("Telefone", value=prefilled["phone"], key="op_phone_pref", disabled=True)
-    elif use_registry and not df_persons.empty:
-        sel_name = st.selectbox("Responsável (cadastro)", options=["-- selecione --"] + df_persons["name"].tolist(),
-                                key="op_sel_person")
-        if sel_name != "-- selecione --":
-            rowp = df_persons[df_persons["name"] == sel_name].iloc[0]
-            taken_by_name = st.text_input("Nome de quem pegou", value=rowp["name"], key="op_nome")
-            taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=rowp["id_code"], key="op_idcode")
-            taken_by_phone= st.text_input("Telefone", value=rowp["phone"], key="op_phone")
-        else:
-            taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_blank")
-            taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_blank")
-            taken_by_phone= st.text_input("Telefone", value="", key="op_phone_blank")
-    else:
-        taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_manual")
-        taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_manual")
-        taken_by_phone= st.text_input("Telefone", value="", key="op_phone_manual")
+        modos = ["Retirar", "Devolver"]
+        default_idx = 0 if (qp_action in (None, "retirar")) else 1
+        modo = st.radio("Ação", modos, horizontal=True, index=default_idx, key="op_modo")
 
-    due_time = None
-    if modo == "Retirar":
-        due_choice = st.selectbox("Prazo de devolução", ["Hoje 12:00", "Hoje 18:00", "Outro", "Sem prazo"], key="op_due_choice")
-        if due_choice == "Hoje 12:00":
-            today = datetime.date.today()
-            due_time = datetime.datetime.combine(today, datetime.time(12,0))
-        elif due_choice == "Hoje 18:00":
-            today = datetime.date.today()
-            due_time = datetime.datetime.combine(today, datetime.time(18,0))
-        elif due_choice == "Outro":
-            due_time = st.datetime_input("Selecione data/hora prevista", key="op_due_dt")
-        else:
-            due_time = None
+        default_key = int(qp_key) if (qp_key and str(qp_key).isdigit()) else None
+        key_number = st.number_input("Nº da chave", min_value=1, step=1,
+                                     value=default_key if default_key else 1, key="op_keynum")
 
-    if modo == "Retirar":
-        st.caption("Assinatura – Entrega da chave")
-        canvas_out = st_canvas(
-            fill_color="rgba(0, 0, 0, 0)",
-            stroke_width=2,
-            stroke_color="#000000",
-            background_color="#FFFFFF",
-            height=180, width=500, drawing_mode="freedraw", key="sig_out"
-        )
-        if st.button("Confirmar retirada", key="btn_checkout"):
-            sig_bytes = None
-            if canvas_out.image_data is not None:
-                try:
-                    img = Image.fromarray((canvas_out.image_data).astype("uint8"))
-                    buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
-                except Exception:
-                    sig_bytes = None
-            ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_by_phone, due_time, sig_bytes)
-            if ok:
-                st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
+        # Info do espaço
+        df_spaces_all = list_spaces(active_only=False)
+        room_info = df_spaces_all[df_spaces_all["key_number"] == int(key_number)]
+        if not room_info.empty:
+            rn = room_info.iloc[0]["room_name"]
+            loc = room_info.iloc[0]["location"] or ""
+            cat = room_info.iloc[0]["category"] or "Sala"
+            st.caption(f"Sala/Lab: **{rn}**  •  Localização: {loc}  •  Categoria: {cat}")
+
+        # Autorizados vigentes (se houver) — restringe a lista
+        df_authorized_now = list_authorized_people_now(int(key_number))
+        df_persons = df_authorized_now if not df_authorized_now.empty else list_persons(active_only=True)
+
+        # Dados do responsável (QR personalizado opcional)
+        prefilled = None
+        if qp_pid and not df_persons.empty and (df_persons["id"] == qp_pid).any():
+            prow = df_persons[df_persons["id"] == qp_pid].iloc[0]
+            prefilled = {"name": prow["name"], "id_code": prow["id_code"], "phone": prow["phone"]}
+
+        st.markdown("**Dados do responsável**")
+        use_registry = st.checkbox("Usar cadastro de responsável", value=True, key="op_use_registry")
+
+        if prefilled:
+            st.info(f"QR personalizado para **{prefilled['name']}**")
+            taken_by_name = st.text_input("Nome de quem pegou", value=prefilled["name"], key="op_nome_pref", disabled=True)
+            taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=prefilled["id_code"], key="op_idcode_pref", disabled=True)
+            taken_by_phone= st.text_input("Telefone", value=prefilled["phone"], key="op_phone_pref", disabled=True)
+        elif use_registry and not df_persons.empty:
+            sel_name = st.selectbox("Responsável (cadastro)", options=["-- selecione --"] + df_persons["name"].tolist(),
+                                    key="op_sel_person")
+            if sel_name != "-- selecione --":
+                rowp = df_persons[df_persons["name"] == sel_name].iloc[0]
+                taken_by_name = st.text_input("Nome de quem pegou", value=rowp["name"], key="op_nome")
+                taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value=rowp["id_code"], key="op_idcode")
+                taken_by_phone= st.text_input("Telefone", value=rowp["phone"], key="op_phone")
             else:
-                st.error(msg)
-    else:
-        if not space_exists_and_active(int(key_number)):
-            st.error(f"A chave {int(key_number)} não está cadastrada/ativa. Cadastre/ative em Cadastros → Espaços.")
+                taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_blank")
+                taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_blank")
+                taken_by_phone= st.text_input("Telefone", value="", key="op_phone_blank")
         else:
-            st.caption("Assinatura – Devolução da chave")
+            taken_by_name = st.text_input("Nome de quem pegou", value="", key="op_nome_manual")
+            taken_by_id   = st.text_input("Matrícula SIAPE / ID estudante", value="", key="op_idcode_manual")
+            taken_by_phone= st.text_input("Telefone", value="", key="op_phone_manual")
+
+        # Prazos
+        due_time = None
+        if modo == "Retirar":
+            due_choice = st.selectbox("Prazo de devolução", ["Hoje 12:00", "Hoje 18:00", "Outro", "Sem prazo"], key="op_due_choice")
+            if due_choice == "Hoje 12:00":
+                today = datetime.date.today(); due_time = datetime.datetime.combine(today, datetime.time(12,0))
+            elif due_choice == "Hoje 18:00":
+                today = datetime.date.today(); due_time = datetime.datetime.combine(today, datetime.time(18,0))
+            elif due_choice == "Outro":
+                due_time = st.datetime_input("Selecione data/hora prevista", key="op_due_dt")
+            else:
+                due_time = None
+
+        # Assinaturas e botões (GESTOR)
+        if modo == "Retirar":
+            st.caption("Assinatura – Entrega da chave")
+            canvas_out = st_canvas(
+                fill_color="rgba(0, 0, 0, 0)",
+                stroke_width=2,
+                stroke_color="#000000",
+                background_color="#FFFFFF",
+                height=180, width=500, drawing_mode="freedraw", key="sig_out"
+            )
+            if st.button("Confirmar retirada", key="btn_checkout"):
+                sig_bytes = None
+                if canvas_out.image_data is not None:
+                    try:
+                        img = Image.fromarray((canvas_out.image_data).astype("uint8"))
+                        buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
+                    except Exception:
+                        sig_bytes = None
+                ok, msg = open_checkout(int(key_number), taken_by_name, taken_by_id, taken_by_phone, due_time, sig_bytes)
+                if ok: st.success(f"Chave {int(key_number)} entregue. Protocolo: {msg}")
+                else:  st.error(msg)
+        else:
+            st.caption("Assinatura – Devolução da chave (Gestor)")
             canvas_in = st_canvas(
                 fill_color="rgba(0, 0, 0, 0)",
                 stroke_width=2,
@@ -475,10 +462,64 @@ with tab_op:
                     except Exception:
                         sig_bytes = None
                 ok, msg = do_checkin(int(key_number), sig_bytes)
-                if ok:
-                    st.success(f"Chave {int(key_number)} devolvida. Protocolo: {msg}")
-                else:
-                    st.error(msg)
+                if ok: st.success(f"Chave {int(key_number)} devolvida. Protocolo: {msg}")
+                else:  st.error(msg)
+
+# -------------- RELATÓRIOS PÚBLICOS ----------
+def render_public_reports():
+    st.subheader("Status das chaves")
+    cats = ["Todas", "Sala", "Laboratório", "Secretaria"]
+    sel_cat = st.selectbox("Filtrar por categoria", cats, index=0, key="pub_cat")
+    df_status = list_status()
+    if sel_cat != "Todas":
+        df_status = df_status[df_status["category"] == sel_cat]
+    st.dataframe(df_status[["key_number","room_name","location","category","status"]], use_container_width=True)
+    num_atraso = (df_status["status"] == "ATRASADA").sum()
+    if num_atraso:
+        st.error(f"⚠️ {num_atraso} chave(s) ATRASADA(s).")
+
+    st.markdown("---")
+    st.subheader("Últimas movimentações")
+    df_tx = list_transactions()
+    # mostra um resumo (sem blobs)
+    cols = ["key_number","taken_by_name","checkout_time","due_time","checkin_time","status"]
+    cols = [c for c in cols if c in df_tx.columns]
+    st.dataframe(df_tx[cols].head(200), use_container_width=True)
+
+# -------------- DEVOLUÇÃO VIA QR (PÚBLICO) ---
+def render_public_qr_return(qkey: int):
+    st.subheader("Devolução de chave (via QR)")
+    if not space_exists_and_active(qkey):
+        st.error("Chave não cadastrada/ativa. Procure a guarita.")
+        return
+    # Info do espaço
+    df_spaces_all = list_spaces(active_only=False)
+    room_info = df_spaces_all[df_spaces_all["key_number"] == int(qkey)]
+    if not room_info.empty:
+        rn = room_info.iloc[0]["room_name"]
+        loc = room_info.iloc[0]["location"] or ""
+        cat = room_info.iloc[0]["category"] or "Sala"
+        st.caption(f"Chave **{qkey}** • {rn} • {loc} • {cat}")
+
+    st.caption("Assine para confirmar a devolução")
+    canvas_in = st_canvas(
+        fill_color="rgba(0, 0, 0, 0)",
+        stroke_width=2,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        height=180, width=500, drawing_mode="freedraw", key="sig_in_public"
+    )
+    if st.button("Confirmar devolução", key="btn_checkin_public"):
+        sig_bytes = None
+        if canvas_in.image_data is not None:
+            try:
+                img = Image.fromarray((canvas_in.image_data).astype("uint8"))
+                buf = io.BytesIO(); img.save(buf, format="PNG"); sig_bytes = buf.getvalue()
+            except Exception:
+                sig_bytes = None
+        ok, msg = do_checkin(int(qkey), sig_bytes)
+        if ok: st.success(f"Chave {int(qkey)} devolvida. Protocolo: {msg}")
+        else:  st.error(msg)
 
 # -------------- CADASTROS (ADMIN) -----------
 if is_admin:
@@ -489,14 +530,10 @@ if is_admin:
 
         st.markdown("**Adicionar/Atualizar espaço**")
         c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            sp_key = st.number_input("Nº da chave", min_value=1, step=1, key="space_key_add")
-        with c2:
-            sp_name = st.text_input("Nome da Sala/Lab", key="space_name_add")
-        with c3:
-            sp_loc = st.text_input("Localização (opcional)", key="space_loc_add")
-        with c4:
-            sp_cat = st.selectbox("Categoria", ["Sala", "Laboratório", "Secretaria"], key="space_cat_add")
+        with c1: sp_key = st.number_input("Nº da chave", min_value=1, step=1, key="space_key_add")
+        with c2: sp_name = st.text_input("Nome da Sala/Lab", key="space_name_add")
+        with c3: sp_loc = st.text_input("Localização (opcional)", key="space_loc_add")
+        with c4: sp_cat = st.selectbox("Categoria", ["Sala", "Laboratório", "Secretaria"], key="space_cat_add")
         if st.button("Salvar/Atualizar espaço", key="space_save"):
             if sp_name.strip():
                 add_space(int(sp_key), sp_name.strip(), sp_loc.strip(), sp_cat)
@@ -533,12 +570,9 @@ if is_admin:
 
         st.markdown("**Adicionar responsável**")
         p1, p2, p3 = st.columns(3)
-        with p1:
-            pn = st.text_input("Nome", key="add_nome")
-        with p2:
-            pidc = st.text_input("SIAPE / Matrícula", key="add_idcode")
-        with p3:
-            pph = st.text_input("Telefone", key="add_phone")
+        with p1: pn = st.text_input("Nome", key="add_nome")
+        with p2: pidc = st.text_input("SIAPE / Matrícula", key="add_idcode")
+        with p3: pph = st.text_input("Telefone", key="add_phone")
         if st.button("Salvar responsável", key="add_person_btn"):
             if pn.strip():
                 add_person(pn.strip(), pidc.strip(), pph.strip())
@@ -568,10 +602,8 @@ if is_admin:
             key_sel = st.selectbox("Chave", options=df_sp_act["key_number"].tolist(), key="auth_key_sel")
             memo = st.text_input("Nº do memorando/circular", key="auth_memo")
             col_af, col_at = st.columns(2)
-            with col_af:
-                vf = st.date_input("Válido de (opcional)", key="auth_from")
-            with col_at:
-                vt = st.date_input("Válido até (opcional)", key="auth_to")
+            with col_af: vf = st.date_input("Válido de (opcional)", key="auth_from")
+            with col_at: vt = st.date_input("Válido até (opcional)", key="auth_to")
             if st.button("Criar autorização", key="auth_create"):
                 aid = add_authorization(int(key_sel), memo.strip(), vf if vf else None, vt if vt else None)
                 st.success(f"Autorização criada: {aid}")
@@ -582,7 +614,6 @@ if is_admin:
                 st.info("Nenhuma autorização criada para esta chave.")
             else:
                 sel_auth = st.selectbox("Selecione a autorização", options=df_auths["id"].tolist(), key="auth_sel")
-                # pessoas ativas
                 dfp = list_persons(active_only=True)
                 if not dfp.empty:
                     sel_people = st.multiselect("Adicionar pessoas (ativas)", options=dfp["name"].tolist(), key="auth_people_sel")
@@ -591,7 +622,6 @@ if is_admin:
                             pid = dfp[dfp["name"]==nm].iloc[0]["id"]
                             add_person_to_authorization(sel_auth, pid)
                         st.success("Pessoas adicionadas.")
-                # lista vinculados
                 c = conn()
                 df_link = pd.read_sql_query("""
                     SELECT p.name, p.id_code, p.phone FROM persons p
@@ -606,12 +636,10 @@ if is_admin:
     with tab_rep:
         st.subheader("Movimentações")
         colr1, colr2 = st.columns(2)
-        with colr1:
-            dt_start = st.date_input("Início (opcional)", key="rep_start")
-        with colr2:
-            dt_end = st.date_input("Fim (opcional)", key="rep_end")
+        with colr1: dt_start = st.date_input("Início (opcional)", key="rep_start")
+        with colr2: dt_end   = st.date_input("Fim (opcional)", key="rep_end")
         start_dt = datetime.datetime.combine(dt_start, datetime.time.min) if dt_start else None
-        end_dt   = datetime.datetime.combine(dt_end, datetime.time.max) if dt_end else None
+        end_dt   = datetime.datetime.combine(dt_end,   datetime.time.max) if dt_end   else None
 
         df_tx = list_transactions(start_dt, end_dt)
         st.dataframe(df_tx, use_container_width=True)
@@ -623,8 +651,7 @@ if is_admin:
             if pd.isna(r["checkin_time"]):
                 if pd.notna(r["due_time"]):
                     try:
-                        due = datetime.datetime.fromisoformat(str(r["due_time"]))
-                        if datetime.datetime.now() > due:
+                        if datetime.datetime.now() > datetime.datetime.fromisoformat(str(r["due_time"])):
                             atrasadas += 1
                     except Exception:
                         pass
@@ -632,10 +659,8 @@ if is_admin:
                     try:
                         co = datetime.datetime.fromisoformat(str(r["checkout_time"]))
                         limit = co.replace(hour=CUTOFF_HOUR_FOR_OVERDUE, minute=0, second=0, microsecond=0)
-                        if limit < co:
-                            limit = limit + datetime.timedelta(days=1)
-                        if datetime.datetime.now() > limit:
-                            atrasadas += 1
+                        if limit < co: limit += datetime.timedelta(days=1)
+                        if datetime.datetime.now() > limit: atrasadas += 1
                     except Exception:
                         pass
         m1, m2, m3 = st.columns(3)
@@ -650,8 +675,7 @@ if is_admin:
 if is_admin:
     with tab_qr:
         st.subheader("QR Codes por chave")
-        if not base_url:
-            st.error("Defina a BASE_URL (em Secrets ou na sidebar) para gerar QRs públicos.")
+        if not base_url: st.error("Defina a BASE_URL (em Secrets ou na sidebar) para gerar QRs públicos.")
         df_sp_act = list_spaces(active_only=True)
         if df_sp_act.empty:
             st.info("Nenhuma chave ativa cadastrada.")
@@ -681,8 +705,7 @@ if is_admin:
                 if images_for_zip:
                     buf = io.BytesIO()
                     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                        for fname, data in images_for_zip:
-                            zf.writestr(fname, data)
+                        for fname, data in images_for_zip: zf.writestr(fname, data)
                     buf.seek(0)
                     st.download_button("Baixar todas em ZIP", data=buf.read(), file_name="qrcodes_chaves.zip", key="qr_zip_btn")
 
@@ -695,9 +718,20 @@ if is_admin:
             sel_key_personal = st.selectbox("Chave", options=df_sp_act["key_number"].tolist(), key="qr_pers_key")
             sel_person = st.selectbox("Responsável", options=dfp_all["name"].tolist(), key="qr_pers_person")
             pid_val = dfp_all[dfp_all["name"] == sel_person].iloc[0]["id"]
-            url_p = build_url(base_url, {"key": sel_key_personal, "action": "retirar", "pid": pid_val})
+            url_p = build_url(base_url, {"key": sel_key_personal, "action": "devolver"})  # para público devolver
+            # Se quiser um QR que pré-preencha retirada para gestor, troque action por "retirar" e use no posto.
             img_p = make_qr(url_p)
             st.image(img_p, use_container_width=False)
             st.caption(url_p)
             st.download_button("Baixar QR (PNG)", data=to_png_bytes(img_p),
                                file_name=f"qr_key{sel_key_personal}_{pid_val[:8]}.png", key="qr_pers_dl")
+
+# -------------- PÚBLICO: DEVOLUÇÃO VIA QR ---
+if (not is_admin) and public_qr_return:
+    with tab_pub_return:
+        render_public_qr_return(int(qp_key))
+
+# -------------- PÚBLICO: RELATÓRIOS ----------
+if (not is_admin):
+    with (tab_pub if public_qr_return else tab_pub):
+        render_public_reports()
