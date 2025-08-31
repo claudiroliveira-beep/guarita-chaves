@@ -11,8 +11,8 @@ import qrcode
 import sqlite3 as _sqlite3  # capturar IntegrityError
 
 # -------------- Configurações --------------
-st.set_page_config(page_title="Guarita - Controle de Chaves", layout="wide")
-APP_TITLE = "Guarita – Controle de Chaves"
+st.set_page_config(page_title="SIGA-Chaves - Guarita Rondon", layout="wide")
+APP_TITLE = "SIGA-Chaves - Guarita Rondon"
 
 ADMIN_PASS = st.secrets.get("STREAMLIT_ADMIN_PASS", os.getenv("STREAMLIT_ADMIN_PASS", ""))
 SECRET_BASE_URL = st.secrets.get("BASE_URL", os.getenv("BASE_URL", "")).strip()
@@ -735,3 +735,4 @@ if (not is_admin) and public_qr_return:
 if (not is_admin):
     with (tab_pub if public_qr_return else tab_pub):
         render_public_reports()
+
