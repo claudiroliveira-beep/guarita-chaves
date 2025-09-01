@@ -20,6 +20,7 @@ SECRET_BASE_URL = st.secrets.get("BASE_URL", os.getenv("BASE_URL", "")).strip()
 DB_PATH = os.getenv("DB_PATH", "keys.db")
 CUTOFF_HOUR_FOR_OVERDUE = int(os.getenv("CUTOFF_HOUR_FOR_OVERDUE", "23"))  # atraso até 23:00
 TOKEN_TTL_MINUTES = int(os.getenv("TOKEN_TTL_MINUTES", "30"))  # validade padrão do token
+QR_CHECK_AUTH_ON_CHECKOUT = os.getenv("QR_CHECK_AUTH_ON_CHECKOUT", "false").lower() == "true" # false (não exige autorização no QR de retirada).
 
 # -------------- Utilidades -----------------
 def now_iso():
@@ -587,7 +588,7 @@ def render_public_reports():
 def render_public_qr_return(qkey: int, token: Optional[str]):
     st.subheader("Devolução de chave (via QR)")
     if not space_exists_and_active(qkey):
-        st.error("Chave não cadastrada/ativa. Procure a guarita."); return
+        st.error("Chave não cadastrada/ativa."); return
 
     # Se vier token, valida (opcional)
     if token:
@@ -628,21 +629,38 @@ def render_public_qr_return(qkey: int, token: Optional[str]):
 def render_public_qr_checkout(qkey: int, pid: str, token: Optional[str]):
     """Tela pública para RETIRADA via QR com pessoa específica (pid) e token obrigatório."""
     if not space_exists_and_active(qkey):
-        st.error("Chave não cadastrada/ativa. Procure a guarita."); return
+        st.error("Chave não cadastrada/ativa."); return
 
     # Valida token (obrigatório na retirada)
     if not token:
-        st.error("Token ausente. Solicite um novo QR na guarita."); return
+        st.error("Token ausente. Solicite um novo QR ao gestor."); return
     ok, msg = validate_qr_token(token, "retirar", qkey, pid)
     if not ok:
         st.error(msg); return
 
     # Busca pessoa e valida autorização vigente
-    df_auth_now = list_authorized_people_now(qkey)
-    if df_auth_now.empty or not (df_auth_now["id"] == pid).any():
-        st.error("Você não está autorizado(a) a retirar esta chave neste período. Procure a guarita.")
-        return
-    prow = df_auth_now[df_auth_now["id"] == pid].iloc[0]
+    #df_auth_now = list_authorized_people_now(qkey)
+    #if df_auth_now.empty or not (df_auth_now["id"] == pid).any():
+    #    st.error("Você não está autorizado(a) a retirar esta chave neste período.")
+    #    return
+    #prow = df_auth_now[df_auth_now["id"] == pid].iloc[0]
+    # ALTERADO PARA: 
+    # Busca pessoa; política: token pode dispensar autorização vigente
+    # Quando QR_CHECK_AUTH_ON_CHECKOUT = false, o fluxo de QR não barra pela autorização — exige apenas token válido
+    if QR_CHECK_AUTH_ON_CHECKOUT:
+        # Exigir autorização vigente
+        df_auth_now = list_authorized_people_now(qkey)
+        if df_auth_now.empty or not (df_auth_now["id"] == pid).any():
+            st.error("Você não está autorizado(a) a retirar esta chave neste período.")
+            return
+        prow = df_auth_now[df_auth_now["id"] == pid].iloc[0]
+    else:
+        # Não exigir autorização: token emitido pelo gestor já vale como autorização
+        person = get_person(pid)
+        if person is None or (("is_active" in person.index) and (int(person["is_active"]) != 1)):
+            st.error("Pessoa não encontrada ou inativa.")
+            return
+        prow = person
 
     # Info do espaço
     df_spaces_all = list_spaces(active_only=False)
@@ -911,5 +929,6 @@ if (not is_admin) and public_qr_return:
 if (not is_admin):
     with tab_pub:
         render_public_reports()
+
 
 
